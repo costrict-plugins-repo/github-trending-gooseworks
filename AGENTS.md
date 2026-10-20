@@ -1,0 +1,37 @@
+# Agent notes for this repo
+
+## Release version policy
+
+Routine CLI releases use **patch bumps**: `0.4.4 → 0.4.5 → 0.4.6`.
+Select `patch` in Changesets for ordinary fixes and new commands. Use `minor`
+or `major` only when the user explicitly requests that version change.
+Keep the package lock and generated skill manifest aligned with the version.
+
+## `skills/` is generated AND committed — never delete it
+
+The vendored entry skills under `skills/` (`gooseworks`, `goose-ads`, `goose-video`)
+are generated from the single source of truth in `src/skills/master-skill.ts` by
+`npm run generate:skills`. They are committed on purpose:
+
+- the npm package ships them (`package.json` `files: ["skills"]`), and
+- the backend app-MCP server serves the copies the **published npm package**
+  ships, at the version it hands out as the video kit (dist-tag `latest` on
+  production, `next` on staging), to Cowork clients that have no filesystem to
+  install into. A skill change reaches staging with the next dev publish and
+  production with the next release.
+- No skill spells out the video kit's command or version: each server answer
+  hands over its own exact command, and its last line says who starts it.
+
+They are NOT stale installed copies. Do not `rm -rf` them when cleaning up
+`~/.agents/skills/` or `~/.claude/skills/` installs — those live in the home
+directory, not here. If a skill body changes, edit `master-skill.ts`, run
+`npm run generate:skills`, and commit the regenerated output.
+
+`skills/goose-product-photos/` is a standalone (non-generated) skill; it is also
+committed and must not be deleted.
+
+## Plugin files
+
+`.claude-plugin/` (plugin.json + marketplace.json) and `.codex-plugin/` make this
+repo installable as a Claude Code plugin marketplace
+(`/plugin marketplace add gooseworks-ai/gooseworks`).

@@ -1,0 +1,183 @@
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+import { getApiKey, getCredentials } from '../auth/credentials';
+
+function getGlobalCursorConfigPath(): string {
+  const platform = process.platform;
+  const home = os.homedir();
+
+  if (platform === 'darwin') {
+    return path.join(home, 'Library', 'Application Support', 'Cursor', 'User', 'globalStorage', 'cursor.mcp', 'config.json');
+  }
+  if (platform === 'linux') {
+    return path.join(home, '.config', 'Cursor', 'User', 'globalStorage', 'cursor.mcp', 'config.json');
+  }
+  // Windows
+  return path.join(home, 'AppData', 'Roaming', 'Cursor', 'User', 'globalStorage', 'cursor.mcp', 'config.json');
+}
+
+function findProjectMcpConfigPath(): string | null {
+  let dir = process.cwd();
+  const root = path.parse(dir).root;
+
+  while (dir !== root) {
+    const cursorDir = path.join(dir, '.cursor');
+    if (fs.existsSync(cursorDir) && fs.statSync(cursorDir).isDirectory()) {
+      return path.join(cursorDir, 'mcp.json');
+    }
+    dir = path.dirname(dir);
+  }
+  return null;
+}
+
+interface McpServerEntry {
+  type?: string;
+  command?: string;
+  args?: string[];
+  url?: string;
+  headers?: Record<string, string>;
+  env?: Record<string, string>;
+}
+
+interface CursorMcpConfig {
+  mcpServers?: Record<string, McpServerEntry>;
+}
+
+export interface CursorMcpFlags {
+  mcp: boolean;
+}
+
+function normalizeMcpUrl(base: string): string {
+  const stripped = base.replace(/\/$/, '');
+  return stripped.endsWith('/mcp') ? stripped : `${stripped}/mcp`;
+}
+
+function readMcpConfig(configPath: string): CursorMcpConfig {
+  try {
+    if (fs.existsSync(configPath)) {
+      const raw = fs.readFileSync(configPath, 'utf-8').trim();
+      if (raw) return JSON.parse(raw);
+    }
+  } catch {
+    // Corrupted or empty — start fresh
+  }
+  return {};
+}
+
+function buildGooseworksEntries(flags: CursorMcpFlags): Record<string, McpServerEntry> {
+  const apiKey = getApiKey();
+  const creds = getCredentials();
+
+  const entries: Record<string, McpServerEntry> = {};
+
+  if (flags.mcp && creds?.mcp_server_url) {
+    entries.gooseworks = {
+      type: 'http',
+      url: normalizeMcpUrl(creds.mcp_server_url),
+      headers: {
+        Authorization: `Bearer ${apiKey || ''}`,
+      },
+    };
+  }
+
+  return entries;
+}
+
+function writeMcpConfig(configPath: string, entries: Record<string, McpServerEntry>): void {
+  const configDir = path.dirname(configPath);
+  fs.mkdirSync(configDir, { recursive: true });
+
+  const config = readMcpConfig(configPath);
+  if (!config.mcpServers) {
+    config.mcpServers = {};
+  }
+
+  // Clean up legacy files-MCP entry from older CLI versions
+  if (config.mcpServers['gooseworks-files']) {
+    delete config.mcpServers['gooseworks-files'];
+  }
+
+  Object.assign(config.mcpServers, entries);
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+}
+
+function removeGooseworksFromConfig(configPath: string): void {
+  try {
+    if (!fs.existsSync(configPath)) return;
+    const config = readMcpConfig(configPath);
+    let changed = false;
+    if (config.mcpServers?.gooseworks) {
+      delete config.mcpServers.gooseworks;
+      changed = true;
+    }
+    if (config.mcpServers?.['gooseworks-files']) {
+      delete config.mcpServers['gooseworks-files'];
+      changed = true;
+    }
+    if (changed) {
+      fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+    }
+  } catch {
+    // Best-effort
+  }
+}
+
+export interface CursorConfigResult {
+  globalPath: string;
+  projectPath: string | null;
+  wroteMcp: boolean;
+}
+
+export function configureCursor(flags: CursorMcpFlags): CursorConfigResult {
+  const entries = buildGooseworksEntries(flags);
+
+  const globalPath = getGlobalCursorConfigPath();
+  const projectPath = findProjectMcpConfigPath();
+
+  if (Object.keys(entries).length > 0) {
+    writeMcpConfig(globalPath, entries);
+    if (projectPath) {
+      writeMcpConfig(projectPath, entries);
+    }
+  }
+
+  return {
+    globalPath,
+    projectPath,
+    wroteMcp: !!entries.gooseworks,
+  };
+}
+
+export function removeCursor(): void {
+  removeGooseworksFromConfig(getGlobalCursorConfigPath());
+
+  const projectPath = findProjectMcpConfigPath();
+  if (projectPath) {
+    removeGooseworksFromConfig(projectPath);
+  }
+}
+
+function configHasGooseworksEntry(configPath: string): boolean {
+  try {
+    if (!fs.existsSync(configPath)) return false;
+    const config = readMcpConfig(configPath);
+    return !!(config.mcpServers?.gooseworks || config.mcpServers?.['gooseworks-files']);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Returns true if the user's Cursor config (global or project) currently has
+ * a `gooseworks` (or legacy `gooseworks-files`) MCP server entry. Used by
+ * `update` to decide whether to refresh Cursor's MCP config in place.
+ */
+export function hasExistingCursorMcpEntry(): boolean {
+  if (configHasGooseworksEntry(getGlobalCursorConfigPath())) return true;
+
+  const projectPath = findProjectMcpConfigPath();
+  if (projectPath && configHasGooseworksEntry(projectPath)) return true;
+
+  return false;
+}

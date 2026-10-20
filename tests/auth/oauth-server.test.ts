@@ -1,0 +1,279 @@
+import * as http from 'http';
+
+jest.mock('../../src/auth/credentials', () => ({
+  saveCredentials: jest.fn(),
+  validateCredentials: jest.fn(),
+}));
+
+jest.mock('open', () => jest.fn().mockResolvedValue(undefined));
+
+jest.mock('../../src/utils/logger', () => ({
+  info: jest.fn(),
+  warn: jest.fn(),
+  error: jest.fn(),
+  success: jest.fn(),
+}));
+
+import open from 'open';
+import { saveCredentials } from '../../src/auth/credentials';
+import { runOAuthFlow } from '../../src/auth/oauth-server';
+import { selectEnvironment } from '../../src/environment';
+import * as logger from '../../src/utils/logger';
+
+const mockOpen = open as jest.MockedFunction<typeof open>;
+const mockSaveCredentials = saveCredentials as jest.MockedFunction<typeof saveCredentials>;
+
+function extractCallbackParams(url: string): { port: string; state: string } {
+  const u = new URL(url);
+  return {
+    port: u.searchParams.get('callback_port')!,
+    state: u.searchParams.get('state')!,
+  };
+}
+
+function hitCallback(port: string, params: Record<string, string>): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const qs = new URLSearchParams(params).toString();
+    const req = http.get(`http://127.0.0.1:${port}/callback?${qs}`, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({
+        status: res.statusCode ?? 0,
+        body: Buffer.concat(chunks).toString('utf-8'),
+      }));
+    });
+    req.on('error', reject);
+  });
+}
+
+async function waitForOpen(): Promise<string> {
+  // Poll until `open` has been called by runOAuthFlow
+  for (let i = 0; i < 50; i++) {
+    if (mockOpen.mock.calls.length > 0) {
+      return mockOpen.mock.calls[0][0] as string;
+    }
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error('open was never called');
+}
+
+describe('auth/oauth-server', () => {
+  beforeEach(() => {
+    selectEnvironment('production');
+    jest.clearAllMocks();
+    mockOpen.mockResolvedValue(undefined as any);
+  });
+  afterEach(() => selectEnvironment('production'));
+
+  it('refuses a staging callback that confirms the production API', async () => {
+    selectEnvironment('staging');
+    const flow = runOAuthFlow('https://api.staging.gooseworks.ai');
+    const failed = flow.catch(error => error);
+    const { port, state } = extractCallbackParams(await waitForOpen());
+    const response = await hitCallback(port, { token: 'fixture', email: 'test@gooseworks.ai', agent_id: 'fixture', state, api_base: 'https://api.gooseworks.ai' });
+    expect(response.status).toBe(400);
+    expect(await failed).toBeInstanceOf(Error);
+    expect(mockSaveCredentials).not.toHaveBeenCalled();
+  });
+
+  it('saves the API confirmed by a matching staging callback', async () => {
+    selectEnvironment('staging');
+    const flow = runOAuthFlow('https://api.staging.gooseworks.ai');
+    const { port, state } = extractCallbackParams(await waitForOpen());
+    const response = await hitCallback(port, { token: 'fixture', email: 'test@gooseworks.ai', agent_id: 'fixture', state, api_base: 'https://api.staging.gooseworks.ai', mcp_server_url: 'https://mcp.staging.gooseworks.ai/mcp' });
+    expect(response.status).toBe(200); await flow;
+    expect(mockSaveCredentials).toHaveBeenCalledWith(expect.objectContaining({ api_base: 'https://api.staging.gooseworks.ai', mcp_server_url: 'https://mcp.staging.gooseworks.ai/mcp' }));
+  });
+
+  it('completes the OAuth flow, saves credentials, and resolves', async () => {
+    const flow = runOAuthFlow('https://api.gooseworks.ai');
+    const url = await waitForOpen();
+    const { port, state } = extractCallbackParams(url);
+
+    const res = await hitCallback(port, {
+      token: 'cal_token',
+      email: 'user@example.com',
+      agent_id: 'agent-123',
+      state,
+    });
+
+    const result = await flow;
+
+    expect(res.status).toBe(200);
+    expect(result).toMatchObject({
+      api_key: 'cal_token',
+      email: 'user@example.com',
+      agent_id: 'agent-123',
+    });
+    expect(mockSaveCredentials).toHaveBeenCalledWith(expect.objectContaining({
+      api_key: 'cal_token',
+      email: 'user@example.com',
+      agent_id: 'agent-123',
+      api_base: 'https://api.gooseworks.ai',
+    }));
+  });
+
+  it('returns 400 when state does not match', async () => {
+    const flow = runOAuthFlow('https://api.gooseworks.ai');
+    const url = await waitForOpen();
+    const { port } = extractCallbackParams(url);
+
+    const res = await hitCallback(port, {
+      token: 'cal_token',
+      email: 'user@example.com',
+      agent_id: 'agent-123',
+      state: 'wrong-state',
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toContain('invalid state');
+    expect(mockSaveCredentials).not.toHaveBeenCalled();
+
+    // Finish the flow with the correct state so the promise resolves and cleans up
+    const { state: realState } = extractCallbackParams(url);
+    await hitCallback(port, {
+      token: 'cal_token',
+      email: 'user@example.com',
+      agent_id: 'agent-123',
+      state: realState,
+    });
+    await flow;
+  });
+
+  it('returns 400 when required params are missing', async () => {
+    const flow = runOAuthFlow('https://api.gooseworks.ai');
+    const url = await waitForOpen();
+    const { port, state } = extractCallbackParams(url);
+
+    const res = await hitCallback(port, { state });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toContain('missing parameters');
+    expect(mockSaveCredentials).not.toHaveBeenCalled();
+
+    // Finish the flow so cleanup runs
+    await hitCallback(port, {
+      token: 'cal_token',
+      email: 'user@example.com',
+      agent_id: 'agent-123',
+      state,
+    });
+    await flow;
+  });
+
+  it('forwards the creator referral code onto the /cli/auth URL as creator_ref', async () => {
+    const flow = runOAuthFlow('https://api.gooseworks.ai', 'K7M2QX9P');
+    const url = await waitForOpen();
+    const u = new URL(url);
+    expect(u.searchParams.get('creator_ref')).toBe('K7M2QX9P');
+
+    // Finish the flow so cleanup runs.
+    const { port, state } = extractCallbackParams(url);
+    await hitCallback(port, {
+      token: 'cal_token',
+      email: 'user@example.com',
+      agent_id: 'agent-123',
+      state,
+    });
+    await flow;
+  });
+
+  it('asks for the account chooser and names the video when the video kit signs in', async () => {
+    const flow = runOAuthFlow('https://api.gooseworks.ai', undefined, {
+      chooseAccount: true,
+      videoId: '6f1c2d3e-4a5b-4c6d-8e7f-9a0b1c2d3e4f',
+    });
+    const url = await waitForOpen();
+    const u = new URL(url);
+    expect(u.searchParams.get('choose_account')).toBe('1');
+    expect(u.searchParams.get('video')).toBe('6f1c2d3e-4a5b-4c6d-8e7f-9a0b1c2d3e4f');
+
+    const { port, state } = extractCallbackParams(url);
+    await hitCallback(port, {
+      token: 'cal_token',
+      email: 'user@example.com',
+      agent_id: 'agent-123',
+      state,
+    });
+    await flow;
+  });
+
+  it('omits creator_ref when no referral code is passed', async () => {
+    const flow = runOAuthFlow('https://api.gooseworks.ai');
+    const url = await waitForOpen();
+    expect(new URL(url).searchParams.has('creator_ref')).toBe(false);
+    expect(new URL(url).searchParams.has('choose_account')).toBe(false);
+    expect(new URL(url).searchParams.has('video')).toBe(false);
+
+    const { port, state } = extractCallbackParams(url);
+    await hitCallback(port, {
+      token: 'cal_token',
+      email: 'user@example.com',
+      agent_id: 'agent-123',
+      state,
+    });
+    await flow;
+  });
+
+  it('forwards optional fields (scope_type, default_agent_id, mcp_server_url) into credentials', async () => {
+    const flow = runOAuthFlow('https://api.gooseworks.ai');
+    const url = await waitForOpen();
+    const { port, state } = extractCallbackParams(url);
+
+    await hitCallback(port, {
+      token: 'cal_token',
+      email: 'user@example.com',
+      agent_id: 'agent-123',
+      scope_type: 'user',
+      default_agent_id: 'agent-default',
+      mcp_server_url: 'http://localhost:6200',
+      state,
+    });
+
+    await flow;
+
+    expect(mockSaveCredentials).toHaveBeenCalledWith(expect.objectContaining({
+      scope_type: 'user',
+      default_agent_id: 'agent-default',
+      mcp_server_url: 'http://localhost:6200',
+    }));
+  });
+
+  // GOOSE-3937: open() resolves even when no browser exists, and an agent's
+  // shell may be on another machine, so the link is always printed.
+  it('prints the sign-in link even when the browser opened', async () => {
+    const flow = runOAuthFlow('https://api.gooseworks.ai');
+    const url = await waitForOpen();
+
+    expect(logger.info).toHaveBeenCalledWith(`If no browser opened, open this link to sign in:\n      ${url}`);
+    expect(logger.warn).not.toHaveBeenCalled();
+
+    const { port, state } = extractCallbackParams(url);
+    await hitCallback(port, { token: 'cal_token', email: 'user@example.com', agent_id: 'agent-123', state });
+    await flow;
+  });
+
+  it('times out after 5 minutes (not 2) and points at device sign-in', async () => {
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
+    try {
+      let settled: Error | undefined;
+      const flow = runOAuthFlow('https://api.gooseworks.ai').catch((error: Error) => { settled = error; });
+      // setImmediate is real here, so this drains every pending promise hop.
+      const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+      jest.advanceTimersByTime(120_000);
+      await flush();
+      expect(settled).toBeUndefined();
+
+      jest.advanceTimersByTime(179_999);
+      await flush();
+      expect(settled).toBeUndefined();
+
+      jest.advanceTimersByTime(1);
+      await flow;
+      expect(settled?.message).toBe('Sign-in timed out after 5 minutes. If your browser is on a different device (cloud agent, SSH), run: gooseworks login --device');
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
